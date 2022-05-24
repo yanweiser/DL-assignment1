@@ -13,6 +13,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import gensim
 import os
+import random
 
 # Add the path to these data manipulation files if necessary:
 # import sys
@@ -35,11 +36,14 @@ embeddings_file = 'GoogleNews-pruned2tweets.bin'
 n_classes = len(LABEL_INDICES)
 n_epochs = 40
 learning_rate = 3e-4
-report_every = 1
+# report_every = 1
 verbose = False
+hp_tune = False
 
 my_device = torch.device('cpu')
+
 # since the computation is not vectorized, its faster to run it on the cpu
+
 # if torch.cuda.is_available():
 #       my_device = torch.device('cuda')
 #       cuda = True
@@ -55,16 +59,48 @@ my_device = torch.device('cpu')
 def label_to_idx(label):
   return torch.LongTensor([LABEL_INDICES[label]]).to(my_device)
 
-# convert Token to its embedding
-def token_to_embed(token, tti, ite):
-      # embed_np = ite[tti[token]]
-      # print(embed_np)
-      if token in tti:
-        return torch.from_numpy(ite[tti.get(token)]).float().to(my_device)
-      else:
-        return torch.zeros((ite.shape[1])).float().to(my_device)
+# return a FloatTensor that is the sum of the word embeddings of the input tweet
+# additional inputs are the token to index (tti) dictionary and the index to embedding (ite) dictionary
+def tweet_to_embed(tweet, tti, ite):
+      temp = np.zeros((len(tweet), 300), dtype='float')
+      for i, token in enumerate(tweet):
+        if token in tti:
+          temp[i] = ite[tti.get(token)]
+      tensor = torch.FloatTensor(temp)
+      return tensor.sum(dim=0).to(my_device)
 
+def train(model, data, optimizer, loss_function, report_every = 10):
+      
+  # convert tweets to embeddings once instead of every epoch
+  embeds = []
+  for tweet in data['training']:
+        embeds.append({'BODY': tweet_to_embed(tweet['BODY'], word_to_idx, pretrained_embeds), 'SENTIMENT': label_to_idx(tweet['SENTIMENT'])})
+  k = len(embeds)
+  for epoch in range(n_epochs):
+    training_losses = []
+    total_loss = 0
+    epoch_order = random.sample(embeds, k) # shuffle the order of tweets every epoch to better generalize
+    for tweet in epoch_order: 
+      preds = model(tweet['BODY'])
+      optimizer.zero_grad()
+      loss = loss_function(torch.reshape(preds, (1,3)), tweet['SENTIMENT'])
+      loss.backward()
+      optimizer.step()
+      total_loss += loss.item()
+    if ((epoch+1) % report_every) == 0:
+      print('epoch: %d,\tloss: %.4f' % (epoch+1, total_loss*100/len(data['training'])))
 
+def test(model, data, kind):
+  correct = 0
+  with torch.no_grad():
+    for tweet in data[kind]:
+      gold_class = label_to_idx(tweet['SENTIMENT'])
+      sent = tweet_to_embed(tweet['BODY'], word_to_idx, pretrained_embeds)
+
+      preds = model(sent)
+      predicted = torch.argmax(preds, dim=0)
+      correct += torch.eq(predicted,gold_class).item()
+  return correct/len(data[kind])
 
 #--- model ---
 
@@ -99,89 +135,61 @@ if __name__=='__main__':
 
   #--- set up ---
   # WRITE CODE HERE
-  model = FFNN(pretrained_embeds, n_classes, hid_size1=128)
+  model = FFNN(pretrained_embeds, n_classes, hid_size1=204, hid_size2=288)
   loss_function = nn.NLLLoss()
-  optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9)
+  optimizer = optim.SGD(model.parameters(), lr=6e-4, momentum=0.86)
   
 
   #--- training ---
-  for epoch in range(n_epochs):
-    training_losses = []
-    total_loss = 0
-    for tweet in data['training']: 
-      gold_class = label_to_idx(tweet['SENTIMENT'])
-      sent = torch.zeros((300), device=my_device).float()
-      for token in tweet['BODY']:
-            sent += token_to_embed(token, word_to_idx, pretrained_embeds)
-      preds = model(sent)
-      optimizer.zero_grad()
-      loss = loss_function(torch.reshape(preds, (1,3)), gold_class)
-      loss.backward()
-      optimizer.step()
-      total_loss += loss.item()
-    if ((epoch+1) % report_every) == 0:
-      print('epoch: %d, loss: %.4f' % (epoch, total_loss*100/len(data['training'])))
+  random.seed(1)
+  train(model, data, optimizer, loss_function, report_every=1)
+
+
+  #--- testing ---
+
+  train_acc = test(model, data, 'training')
+  val_acc = test(model, data, 'development.gold')
+  test_acc = test(model, data, 'test.gold')
+  print('Accuracies:\n train = {:.2f}\n val = {:.2f}\n test = {:.2f}'.format(100*train_acc, 100*val_acc, 100*test_acc))
     
+  #--- optimizing ---
   # Feel free to use the development data to tune hyperparameters if you like!
+  # Parameters to tune : learning rate, hidden size 1, hidden size 2
+  # random search, ranges:
+  if hp_tune:
+    lr_range = [5e-4, 5e-3]
+    h1_range = [200, 300]
+    h2_range = [200, 300]
+    mom_range = [0.85, 0.90]
 
-  #--- test ---
-  correct = 0
-  with torch.no_grad():
-    for tweet in data['training']:
-      gold_class = label_to_idx(tweet['SENTIMENT'])
-    
-      # WRITE CODE HERE
-      sent = torch.zeros((300), device=my_device).float()
-      for token in tweet['BODY']:
-            sent += token_to_embed(token, word_to_idx, pretrained_embeds)
-      preds = model(sent)
-      predicted = torch.argmax(preds, dim=0)
-      correct += torch.eq(predicted,gold_class).item()
+    NUM_TRIALS = 3
+    trial_vars = {}
+    best = 0
+    for i in range(NUM_TRIALS):
+      if i > 0:
+            print('------------------------------')
+      trial_vars['h1_trial'] = random.randint(h1_range[0], h1_range[1])
+      trial_vars['h2_trial'] = random.randint(h2_range[0], h2_range[1])
+      trial_vars['lr_trial'] = random.uniform(lr_range[0], lr_range[1])
+      # trial_vars['lr_trial'] = 0.0006314250778068356
+      trial_vars['mom_trial'] = random.uniform(mom_range[0], mom_range[1])
+      print(f'Trial {i+1}:\n Learning rate = {trial_vars["lr_trial"]}\n hidden size 1 = {trial_vars["h1_trial"]}\n hidden size 2 = {trial_vars["h2_trial"]}\n momentum = {trial_vars["mom_trial"]}')
+      trial_model = FFNN(pretrained_embeds, n_classes, hid_size1=trial_vars['h1_trial'], hid_size2=trial_vars['h2_trial'])
+      trial_loss_function = nn.NLLLoss()
+      trial_optimizer = optim.SGD(trial_model.parameters(), lr=trial_vars['lr_trial'], momentum=trial_vars['mom_trial'])
 
-      if verbose:
-        print('TEST DATA: %s, OUTPUT: %s, GOLD LABEL: %d' % 
-              (tweet['BODY'], tweet['SENTIMENT'], predicted))
-        
-    print('training accuracy: %.2f' % (100.0 * correct / len(data['training'])))
+      train(trial_model, data, trial_optimizer, trial_loss_function, report_every=100)
 
-
-  correct = 0
-  with torch.no_grad():
-    for tweet in data['development.gold']:
-      gold_class = label_to_idx(tweet['SENTIMENT'])
-    
-      # WRITE CODE HERE
-      sent = torch.zeros((300), device=my_device).float()
-      for token in tweet['BODY']:
-            sent += token_to_embed(token, word_to_idx, pretrained_embeds)
-      preds = model(sent)
-      predicted = torch.argmax(preds, dim=0)
-      correct += torch.eq(predicted,gold_class).item()
-
-      if verbose:
-        print('TEST DATA: %s, OUTPUT: %s, GOLD LABEL: %d' % 
-              (tweet['BODY'], tweet['SENTIMENT'], predicted))
-        
-    print('development accuracy: %.2f' % (100.0 * correct / len(data['development.gold'])))
-
-
-  correct = 0
-  with torch.no_grad():
-    for tweet in data['test.gold']:
-      gold_class = label_to_idx(tweet['SENTIMENT'])
-    
-      # WRITE CODE HERE
-      sent = torch.zeros((300), device=my_device).float()
-      for token in tweet['BODY']:
-            sent += token_to_embed(token, word_to_idx, pretrained_embeds)
-      preds = model(sent)
-      predicted = torch.argmax(preds, dim=0)
-      correct += torch.eq(predicted,gold_class).item()
-
-      if verbose:
-        print('TEST DATA: %s, OUTPUT: %s, GOLD LABEL: %d' % 
-              (tweet['BODY'], tweet['SENTIMENT'], predicted))
-        
-    print('test accuracy: %.2f' % (100.0 * correct / len(data['test.gold'])))
-
+      train_acc = test(trial_model, data, 'training')
+      val_acc = test(trial_model, data, 'development.gold')
+      test_acc = test(trial_model, data, 'test.gold')
+      print('Accuracies:\n train = {:.2f}\n val = {:.2f}\n test = {:.2f}'.format(100*train_acc, 100*val_acc, 100*test_acc))
+      performance = 0.8*train_acc+2*val_acc # arbitrary measurement of how well the model performs mainly based on the validation accuracy
+      print('Performance = {}'.format(performance))
+      if performance > best:
+            best = performance
+            best_vars = trial_vars
+    print('\n\n------------------------------')
+    print('Best Model parameters:')
+    print(f' Learning rate = {best_vars["lr_trial"]}\n hidden size 1 = {best_vars["h1_trial"]}\n hidden size 2 = {best_vars["h2_trial"]}\n momentum = {best_vars["mom_trial"]}')
 
